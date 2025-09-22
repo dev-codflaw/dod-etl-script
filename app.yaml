@@ -1,0 +1,8 @@
+name: etl-api
+services:
+  - name: etl-api-service
+    environment_slug: python
+    run_command: gunicorn -w 2 -b 0.0.0.0:$PORT etl_api_runner:app
+    http_port: $PORT
+    instance_size_slug: professional-s   # 1 CPU / 8GB RAM
+    instance_count: 1

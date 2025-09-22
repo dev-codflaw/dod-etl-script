@@ -1,0 +1,7 @@
+flask
+gunicorn
+pymongo
+boto3
+python-dotenv
+psutil
+tqdm
