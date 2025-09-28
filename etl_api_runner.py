@@ -6,7 +6,6 @@ import psutil
 from threading import Thread, Lock
 from pymongo import MongoClient
 from dotenv import load_dotenv
-from tqdm import tqdm
 import boto3
 from flask import Flask, jsonify
 
@@ -49,39 +48,96 @@ lock = Lock()
 start_time = None
 
 # -----------------------------
-# Insert CSV Stream
+# Download with Progress
+# -----------------------------
+def download_with_progress(bucket, key, filename):
+    try:
+        obj = s3.head_object(Bucket=bucket, Key=key)
+        total_size = obj['ContentLength']
+        print(f"\n⬇️ Downloading {filename} ({total_size/1024:.2f} KB)...")
+
+        response = s3.get_object(Bucket=bucket, Key=key)
+        body = response['Body']
+
+        chunk_size = 1024 * 1024  # 1 MB
+        downloaded = 0
+        buffer = io.BytesIO()
+
+        while True:
+            data = body.read(chunk_size)
+            if not data:
+                break
+            buffer.write(data)
+            downloaded += len(data)
+            percent = (downloaded / total_size) * 100
+            print(f"   {downloaded/1024:.2f} KB / {total_size/1024:.2f} KB ({percent:.2f}%)", end="\r")
+
+        print(f"\n✅ Finished downloading {filename}")
+        buffer.seek(0)
+        return buffer
+
+    except Exception as e:
+        print(f"❌ Failed to download {filename}: {e}")
+        return None
+
+# -----------------------------
+# Insert CSV Stream (Improved)
 # -----------------------------
 def insert_csv_from_stream(stream, collection_name):
     global inserted_count, total_count
     collection = db[collection_name]
-    reader = csv.reader(io.StringIO(stream.read().decode("utf-8")))
-    rows = list(reader)
-    total_count += len(rows)
 
-    for row in tqdm(rows, desc=f"Inserting: {collection_name}", unit="row"):
+    try:
+        reader = csv.reader(io.StringIO(stream.read().decode("utf-8")))
+        rows = list(reader)
+    except Exception as e:
+        print(f"❌ Failed to read CSV stream for {collection_name}: {e}")
+        return
+
+    total_count += len(rows)
+    print(f"📥 Starting insert for `{collection_name}` → {len(rows)} rows")
+
+    for i, row in enumerate(rows, start=1):
         if len(row) < 2:
+            print(f"⚠️ Skipping malformed row {i}: {row}")
             continue
+
         doc = {"url_id": row[0], "input_url": row[1], "status": "pending"}
+
         try:
-            collection.insert_one(doc)
-            with lock:
-                inserted_count += 1
+            # avoid duplicates
+            if not collection.find_one({"url_id": doc["url_id"]}):
+                collection.insert_one(doc)
+                with lock:
+                    inserted_count += 1
+            else:
+                print(f"⚠️ Skipped duplicate url_id {doc['url_id']}")
         except Exception as e:
-            print(f"❌ Error inserting row: {e}")
+            print(f"❌ Error inserting row {i} in `{collection_name}`: {e}")
+
+        if i % 1000 == 0:  # progress every 1000 rows
+            print(f"✅ Inserted {i}/{len(rows)} rows into `{collection_name}`")
+
+    print(f"🎯 Finished `{collection_name}` → {inserted_count}/{total_count} total inserted\n")
 
 # -----------------------------
-# ETL Process
+# ETL Process (Improved)
 # -----------------------------
 def process_all_csv_from_spaces():
     global job_running, start_time
     job_running = True
     start_time = time.time()
 
-    print(f"📦 Scanning bucket `{SPACES_BUCKET}` under prefix `{SPACES_PREFIX}`...\n")
-    objects = s3.list_objects_v2(Bucket=SPACES_BUCKET, Prefix=SPACES_PREFIX)
+    print(f"\n📦 Scanning bucket `{SPACES_BUCKET}` under prefix `{SPACES_PREFIX}`...\n")
+    try:
+        objects = s3.list_objects_v2(Bucket=SPACES_BUCKET, Prefix=SPACES_PREFIX)
+    except Exception as e:
+        print(f"❌ Failed to list objects in bucket: {e}")
+        job_running = False
+        return
 
     if 'Contents' not in objects:
-        print("⚠️ No files found.")
+        print("⚠️ No CSV files found in bucket.")
         job_running = False
         return
 
@@ -92,12 +148,18 @@ def process_all_csv_from_spaces():
         filename = os.path.basename(key)
         collection_name = os.path.splitext(filename)[0] if MODE == "per_file" else FIXED_COLLECTION
 
-        print(f"📤 Downloading `{filename}` from Spaces → inserting into `{collection_name}`")
-        response = s3.get_object(Bucket=SPACES_BUCKET, Key=key)
-        insert_csv_from_stream(response['Body'], collection_name)
+        print(f"\n📤 Processing `{filename}` → inserting into `{collection_name}`")
+
+        buffer = download_with_progress(SPACES_BUCKET, key, filename)
+        if buffer:
+            try:
+                insert_csv_from_stream(buffer, collection_name)
+            except Exception as e:
+                print(f"❌ Critical error while processing `{filename}`: {e}")
 
     job_running = False
-    print("\n🎯 All uploads complete.")
+    duration = int(time.time() - start_time)
+    print(f"\n🎯 All uploads complete in {duration}s. Total inserted: {inserted_count}/{total_count}")
 
 # -----------------------------
 # Flask API for control + stats
@@ -119,22 +181,66 @@ def stop_job():
     job_running = False
     return {"status": "🛑 Stop signal sent (will finish current file)"}
 
+
 @app.route("/stats")
 def stats():
     cpu = psutil.cpu_percent(interval=0.5)
     mem = psutil.virtual_memory()
     uptime = int(time.time() - start_time) if start_time else 0
-    return jsonify({
-        "inserted": inserted_count,
-        "total": total_count,
-        "progress": f"{(inserted_count/total_count*100):.2f}%" if total_count else "0%",
-        "cpu_usage": f"{cpu}%",
-        "memory_usage": f"{mem.percent}%",
-        "uptime_seconds": uptime,
-        "job_running": job_running,
-        "healthy": cpu < 80 and mem.percent < 80
-    })
+
+    progress = f"{(inserted_count/total_count*100):.2f}%" if total_count else "0%"
+    healthy = cpu < 80 and mem.percent < 80
+
+    # ✅ Mobile-friendly HTML with inline CSS
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <style>
+        body {{
+          font-family: Arial, sans-serif;
+          padding: 15px;
+          background: #f9f9f9;
+          color: #333;
+        }}
+        h2 {{
+          text-align: center;
+          color: #444;
+        }}
+        table {{
+          width: 100%;
+          border-collapse: collapse;
+          margin-top: 15px;
+        }}
+        th, td {{
+          padding: 10px;
+          text-align: left;
+          border-bottom: 1px solid #ddd;
+        }}
+        tr:hover {{ background-color: #f1f1f1; }}
+        .ok {{ color: green; font-weight: bold; }}
+        .bad {{ color: red; font-weight: bold; }}
+      </style>
+    </head>
+    <body>
+      <h2>📊 Job Stats</h2>
+      <table>
+        <tr><th>Inserted</th><td>{inserted_count}</td></tr>
+        <tr><th>Total</th><td>{total_count}</td></tr>
+        <tr><th>Progress</th><td>{progress}</td></tr>
+        <tr><th>CPU Usage</th><td>{cpu}%</td></tr>
+        <tr><th>Memory Usage</th><td>{mem.percent}%</td></tr>
+        <tr><th>Uptime (sec)</th><td>{uptime}</td></tr>
+        <tr><th>Job Running</th><td>{"✅ Yes" if job_running else "❌ No"}</td></tr>
+        <tr><th>Status</th><td class="{ 'ok' if healthy else 'bad' }">{'Healthy' if healthy else 'High Load'}</td></tr>
+      </table>
+    </body>
+    </html>
+    """
+    return html
 
 # -----------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000)
+
